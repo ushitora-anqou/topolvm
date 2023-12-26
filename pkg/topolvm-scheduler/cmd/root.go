@@ -1,18 +1,26 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
-	"github.com/cybozu-go/well"
 	"github.com/spf13/cobra"
 	"github.com/topolvm/topolvm"
 	"github.com/topolvm/topolvm/scheduler"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/yaml"
 )
 
 var cfgFilePath string
+var zapOpts zap.Options
 
 const defaultDivisor = 1
 const defaultListenAddr = ":8000"
@@ -54,15 +62,13 @@ The default divisor is 1.  It can be changed with a command-line option.
 `,
 	RunE: func(cmd *cobra.Command, args []string) error {
 		cmd.SilenceUsage = true
-		return subMain()
+		return subMain(cmd.Context())
 	},
 }
 
-func subMain() error {
-	err := well.LogConfig{}.Apply()
-	if err != nil {
-		return err
-	}
+func subMain(ctx context.Context) error {
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&zapOpts)))
+	logger := log.FromContext(ctx)
 
 	if len(cfgFilePath) != 0 {
 		b, err := os.ReadFile(cfgFilePath)
@@ -80,23 +86,29 @@ func subMain() error {
 		return err
 	}
 
-	serv := &well.HTTPServer{
-		Server: &http.Server{
-			Addr:    config.ListenAddr,
-			Handler: h,
-		},
+	serv := &http.Server{
+		Addr:        config.ListenAddr,
+		Handler:     accessLogHandler(ctx, h),
+		ReadTimeout: 30 * time.Second,
 	}
+
+	idleConnsClosed := make(chan struct{})
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+		<-sigCh
+
+		if err := serv.Shutdown(ctx); err != nil {
+			logger.Error(err, "failed to shutdown gracefully")
+		}
+		close(idleConnsClosed)
+	}()
 
 	err = serv.ListenAndServe()
-	if err != nil {
+	if !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
-	err = well.Wait()
-
-	if err != nil && !well.IsSignaled(err) {
-		return err
-	}
-
+	<-idleConnsClosed
 	return nil
 }
 
